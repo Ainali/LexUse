@@ -4,13 +4,44 @@ import json
 import logging
 import os.path
 import random
+import sys
 import time
 # import asyncio
 import httpx
-import riksdagen
 from wikibaseintegrator import wbi_core, wbi_login
 
 import config
+import download_data
+import europarl
+import loglevel
+import riksdagen
+
+# Terminology used
+# record = sentence + data
+# sentence = string of text
+
+# Check version
+try:
+    assert sys.version_info >= (3, 7)
+except AssertionError:
+    print("Error! This script requires Python 3.7 minimum. " +
+          f"Your version of python: {sys.version[0:5]} " +
+          "is very old and not " +
+          "supported by this script. Please upgrade python. " +
+          "If you are on Ubuntu 18.04 we encourage you to upgrade Ubuntu.")
+    exit(0)
+
+# Logging
+logger = logging.getLogger(__name__)
+if config.loglevel is None:
+    # Set loglevel
+    print("Setting loglevel in config")
+    loglevel.set_loglevel()
+logger.setLevel(config.loglevel)
+logger.level = logger.getEffectiveLevel()
+file_handler = logging.FileHandler("util.log")
+logger.addHandler(file_handler)
+
 # Constants
 wd_prefix = "http://www.wikidata.org/entity/"
 
@@ -19,16 +50,21 @@ wd_prefix = "http://www.wikidata.org/entity/"
 #
 # Entry through process_lexeme_data()
 # Call in while loop
-#   if excluded:
+#   if not excluded:
 #     process_result()
 #       Call get_sentences_from_apis()
+#         Call europarl..get_records(data)
 #         Call riksdagen.get_records(data)
-#           See riksdagen.py for details
+#         Collect records in one big dictionary
 #       for loop
 #         present_sentence()
+#           Sort showing shortest first
 #           call prompt_sense_approval()
 #             if >1
 #               call prompt_choose_sense()
+#           Add usage example
+#           Add to watchlist
+#           Add form to exclude list to avoid duplicates caused by sparql lag
 
 
 def yes_no_skip_question(message: str):
@@ -183,10 +219,10 @@ def extract_data(result):
     )
 
 
-# async def async_fetch_from_url(url):
-#     async with httpx.AsyncClient() as client:
-#         response = await client.get(url)
-#         return response
+async def async_fetch_from_url(url):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+        return response
 
 
 def add_usage_example(
@@ -198,16 +234,11 @@ def add_usage_example(
         word=None,
         publication_date=None,
         language_style=None,
-        form_of_utterance=None,
+        type_of_reference=None,
+        source=None,
+        line=None,
 ):
     # Use WikibaseIntegrator aka wbi to upload the changes in one edit
-    if publication_date is not None:
-        publication_date = datetime.fromisoformat(publication_date)
-    else:
-        print("Publication date of document {document_id} " +
-              "is missing. We have no fallback for that at the moment. " +
-              "Abort adding usage example.")
-        return False
     link_to_form = wbi_core.Form(
         prop_nr="P5830",
         value=form_id,
@@ -235,50 +266,105 @@ def add_usage_example(
         is_qualifier=True
     )
     # oral or written
-    if form_of_utterance == "written":
+    if type_of_reference == "written":
         medium = "Q47461344"
     else:
-        if form_of_utterance == "oral":
+        if type_of_reference == "oral":
             medium = "Q52946"
         else:
-            print(f"Error. Form of utterance {form_of_utterance} " +
+            print(f"Error. Type of reference {type_of_reference} " +
                   "not one of (written,oral)")
             exit(1)
-    logging.debug("Generating qualifier form_of_uttance " +
+    logging.debug("Generating qualifier type of reference " +
                   f"with {medium}")
-    form_of_utterance_qualifier = wbi_core.ItemID(
+    type_of_reference_qualifier = wbi_core.ItemID(
         prop_nr="P3865",
         value=medium,
         is_qualifier=True
     )
-    reference = [
-        wbi_core.ItemID(
-            prop_nr="P248",  # Stated in Riksdagen open data portal
+    if source == "riksdagen":
+        if publication_date is not None:
+            publication_date = datetime.fromisoformat(publication_date)
+        else:
+            print("Publication date of document {document_id} " +
+                  "is missing. We have no fallback for that at the moment. " +
+                  "Abort adding usage example.")
+            return False
+        stated_in = wbi_core.ItemID(
+            prop_nr="P248",
             value="Q21592569",
             is_reference=True
-        ),
-        wbi_core.ExternalID(
+        )
+        document_id = wbi_core.ExternalID(
             prop_nr="P8433",  # Riksdagen Document ID
             value=document_id,
             is_reference=True
-        ),
-        wbi_core.Time(
-            prop_nr="P813",  # Fetched today
-            time=datetime.utcnow().replace(
-                tzinfo=timezone.utc
-            ).replace(
-                hour=0,
-                minute=0,
-                second=0,
-            ).strftime("+%Y-%m-%dT%H:%M:%SZ"),
-            is_reference=True,
-        ),
-        wbi_core.Time(
-            prop_nr="P577",  # Publication date
-            time=publication_date.strftime("+%Y-%m-%dT00:00:00Z"),
-            is_reference=True,
         )
-    ]
+        reference = [
+            stated_in,
+            document_id,
+            wbi_core.Time(
+                prop_nr="P813",  # Fetched today
+                time=datetime.utcnow().replace(
+                    tzinfo=timezone.utc
+                ).replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                ).strftime("+%Y-%m-%dT%H:%M:%SZ"),
+                is_reference=True,
+            ),
+            wbi_core.Time(
+                prop_nr="P577",  # Publication date
+                time=publication_date.strftime("+%Y-%m-%dT00:00:00Z"),
+                is_reference=True,
+            ),
+            type_of_reference_qualifier,
+        ]
+    if source == "europarl":
+        stated_in = wbi_core.ItemID(
+            prop_nr="P248",
+            value="Q5412081",
+            is_reference=True
+        )
+        reference = [
+            stated_in,
+            wbi_core.Time(
+                prop_nr="P813",  # Fetched today
+                time=datetime.utcnow().replace(
+                    tzinfo=timezone.utc
+                ).replace(
+                    hour=0,
+                    minute=0,
+                    second=0,
+                ).strftime("+%Y-%m-%dT%H:%M:%SZ"),
+                is_reference=True,
+            ),
+            wbi_core.Time(
+                prop_nr="P577",  # Publication date
+                time="+2012-05-12T00:00:00Z",
+                is_reference=True,
+            ),
+            wbi_core.Url(
+                prop_nr="P854",  # reference url
+                value="http://www.statmt.org/europarl/v7/sv-en.tgz",
+                is_reference=True,
+            ),
+            # filename in archive
+            wbi_core.String(
+                (f"europarl-v7.{config.language_code}" +
+                 f"-en.{config.language_code}"),
+                "P7793",
+                is_reference=True,
+            ),
+            # line number
+            wbi_core.String(
+                str(line),
+                "P7421",
+                is_reference=True,
+            ),
+            type_of_reference_qualifier,
+        ]
     # This is the usage example statement
     claim = wbi_core.MonolingualText(
         sentence,
@@ -289,7 +375,6 @@ def add_usage_example(
             link_to_form,
             link_to_sense,
             language_style_qualifier,
-            form_of_utterance_qualifier,
         ],
         # Add reference
         references=[reference],
@@ -334,6 +419,8 @@ def prompt_choose_sense(senses):
             # Put each key -> value into a new nested dictionary
             for sense in senses:
                 options += f"\n{number}) {senses[number]['gloss']}"
+                if config.show_sense_urls:
+                    options += f" ({wd_prefix + senses[number]['sense_id']} )"
                 number += 1
             options += "\nPlease input a number or 0 to cancel: "
             choice = int(input(options))
@@ -403,9 +490,16 @@ def prompt_sense_approval(sentence=None, data=None):
     if number_of_senses > 0:
         if number_of_senses == 1:
             gloss = senses[1]["gloss"]
-            if yes_no_question("Found only one sense. " +
-                               "Does this example fit the following " +
-                               f"gloss? \n'{gloss}'"):
+            sense_id = senses[1]["sense_id"]
+            if config.show_sense_urls:
+                question = ("Found only one sense. " +
+                            "Does this example fit the following " +
+                            f"gloss? {wd_prefix + sense_id}\n'{gloss}'")
+            else:
+                question = ("Found only one sense. " +
+                            "Does this example fit the following " +
+                            f"gloss?\n'{gloss}'")
+            if yes_no_question(question):
                 return {
                     "sense_id": senses[1]["sense_id"],
                     "sense_gloss": gloss
@@ -458,16 +552,29 @@ def prompt_sense_approval(sentence=None, data=None):
 
 
 def get_sentences_from_apis(result):
+    """Returns a dict with sentences as key and id as value"""
     data = extract_data(result)
     form_id = data["form_id"]
     word = data["word"]
     print(f"Trying to find examples for the {data['category']} lexeme " +
           f"form: {word} with id: {form_id}")
-    # Riksdagen API
-    # We only have one source so return that for now
-    return riksdagen.get_records(data)
-    # TODO K-samsök
-    # TODO Europarl corpus
+    if config.language_code == "sv":
+        records = {}
+        # Europarl corpus
+        # Download first
+        download_data.fetch()
+        europarl_records = europarl.get_records(data)
+        for record in europarl_records:
+            records[record] = europarl_records[record]
+        # Riksdagen API is slow, only use it if we must
+        if len(europarl_records) < 50:
+            riksdagen_records = riksdagen.get_records(data)
+            for record in riksdagen_records:
+                records[record] = riksdagen_records[record]
+        logger.debug(f"returning from apis:{records}")
+        return records
+        # TODO K-samsök
+        # TODO Europarl corpus
 
 
 def present_sentence(
@@ -476,14 +583,16 @@ def present_sentence(
         document_id: str = None,
         date: str = None,
         language_style: str = None,
-        form_of_utterance: str = None,
+        type_of_reference: str = None,
+        source: str = None,
+        line: str = None
 ):
     """Return True, False or None (skip)"""
     word_count = count_words(sentence)
     result = yes_no_skip_question(
             f"Found the following sentence with {word_count} " +
             "words. Is it suitable as a usage example " +
-            f"for the form '{data['word']}'? \n" +
+            f"for the {data['category']} form '{data['word']}'? \n" +
             f"'{sentence}'"
     )
     if result:
@@ -506,7 +615,9 @@ def present_sentence(
                     word=data["word"],
                     publication_date=date,
                     language_style=language_style,
-                    form_of_utterance=form_of_utterance,
+                    type_of_reference=type_of_reference,
+                    source=source,
+                    line=line,
                 )
                 if result:
                     print("Successfully added usage example " +
@@ -532,7 +643,7 @@ def save_to_exclude_list(data: dict):
         exit(1)
     form_id = data["form_id"]
     word = data["word"]
-    print(f"Adding {word} to exclude list")
+    print(f"Adding {word} to local exclude list '{config.exclude_list}'")
     if config.debug_exclude_list:
         logging.debug(f"data to exclude:{data}")
     form_data = dict(
@@ -544,10 +655,10 @@ def save_to_exclude_list(data: dict):
         logging.debug(f"adding:{form_id}:{form_data}")
     if os.path.isfile('exclude_list.json'):
         # Read the file
-        with open('exclude_list.json', 'r', encoding='utf-8') as myfile:
+        with open(config.exclude_list, 'r', encoding='utf-8') as myfile:
             json_data = myfile.read()
         if len(json_data) > 0:
-            with open('exclude_list.json', 'w', encoding='utf-8') as myfile:
+            with open(config.exclude_list, 'w', encoding='utf-8') as myfile:
                 # parse file
                 exclude_list = json.loads(json_data)
                 exclude_list[form_id] = form_data
@@ -559,7 +670,7 @@ def save_to_exclude_list(data: dict):
             exit(1)
     else:
         # Create the file
-        with open("exclude_list.json", "w", encoding='utf-8') as outfile:
+        with open(config.exclude_list, "w", encoding='utf-8') as outfile:
             # Create new file with dict and item
             exclude_list = {}
             exclude_list[form_id] = form_data
@@ -572,7 +683,7 @@ def process_result(result, data):
     # ask to continue
     # if yes_no_question(f"\nWork on {data['word']}?"):
     # This dict holds the sentence as key and
-    # riksdagen_document_id as value
+    # riksdagen_document_id or other id as value
     sentences_and_result_data = get_sentences_from_apis(result)
     if sentences_and_result_data is not None:
         # Sort so that the shortest sentence is first
@@ -588,36 +699,49 @@ def process_result(result, data):
             document_id = result_data["document_id"]
             date = result_data["date"]
             style = result_data["language_style"]
-            medium = result_data["form_of_utterance"]
-            print("Presenting sentence " +
-                  f"{count}/{len(sorted_sentences)} from {date} from " +
-                  f"{riksdagen.baseurl + document_id}")
+            medium = result_data["type_of_reference"]
+            source = result_data["source"]
+            line = result_data["line"]
+            if source == "riksdagen":
+                print("Presenting sentence " +
+                      f"{count}/{len(sorted_sentences)} from {date} from " +
+                      f"{riksdagen.baseurl + document_id}")
+            elif source == "europarl":
+                print("Presenting sentence " +
+                      f"{count}/{len(sorted_sentences)} " +
+                      "from europarl")
+            else:
+                print("Presenting sentence " +
+                      f"{count}/{len(sorted_sentences)} from {date}")
             logging.info(f"with style: {style} " +
                          f"and medium: {medium}")
             result = present_sentence(
                 data=data,
-                sentence=sentence,
+                # Trim sentence
+                sentence=sentence.strip(),
                 document_id=document_id,
                 date=date,
                 language_style=style,
-                form_of_utterance=medium,
+                type_of_reference=medium,
+                source=source,
+                line=line,
             )
             count += 1
             # Break out of the for loop by returning early because one
             # example was already choosen for this result or if the form
             # was skipped. False means that we could not find a sentence, it
-            # could be related to low number of records being fetched so we dont
-            # excude it.
+            # could be related to low number of records being fetched so we
+            # don't excude it.
             if result is not False:
                 # Add to temporary exclude_list
                 logging.debug("adding to exclude list after presentation")
                 save_to_exclude_list(data)
                 # break
                 return
-    else:
-        print("Added to excludelist because of no " +
-              "suitable sentences were found")
-        save_to_exclude_list(data)
+    # else:
+    #     print("Added to excludelist because of no " +
+    #           "suitable sentences were found")
+    #     save_to_exclude_list(data)
 
 
 def in_exclude_list(data: dict):
